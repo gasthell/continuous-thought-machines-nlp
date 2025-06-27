@@ -119,6 +119,7 @@ def download_and_extract_ag_news(root='./data'):
 
 def simple_tokenizer(text):
     """Simple example of tokenization"""
+    return text.lower().strip().split()
     # return word_tokenize(text.lower().strip())
 
 def build_vocab(data, tokenizer, max_size):
