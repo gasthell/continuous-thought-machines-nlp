@@ -128,7 +128,7 @@ def build_vocab(data, tokenizer, max_size):
     for _, text in data:
         counter.update(tokenizer(text))
 
-    most_common_words = [word for word, _ in counter.most_common(max_size - 2)] # -2 для <pad> и <unk>
+    most_common_words = [word for word, _ in counter.most_common(max_size - 2)] # -2 for <pad> и <unk>
     
     word_to_idx = {'<pad>': 0, '<unk>': 1}
     for i, word in enumerate(most_common_words):
