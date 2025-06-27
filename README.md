@@ -146,6 +146,45 @@ class NewsDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+def train_epoch(model, dataloader, optimizer, criterion, model_type='lstm'):
+    model.train()
+    total_acc, total_loss, total_count = 0, 0, 0
+    progress_bar = tqdm(dataloader, desc=f'Training {model_type}')
+    for idx, (label, text) in enumerate(progress_bar):
+        label, text = label.to(DEVICE), text.to(DEVICE)
+        optimizer.zero_grad()
+        if model_type == 'ctm':
+            predictions, _, _ = model(text)
+            logits = predictions[:, :, -1]
+        else:
+            logits = model(text)
+        loss = criterion(logits, label)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+        total_acc += (logits.argmax(1) == label).sum().item()
+        total_loss += loss.item()
+        total_count += label.size(0)
+        progress_bar.set_postfix({'loss': total_loss / total_count, 'acc': total_acc / total_count})
+    return total_acc / total_count, total_loss / total_count
+
+def evaluate(model, dataloader, criterion, model_type='lstm'):
+    model.eval()
+    total_acc, total_loss, total_count = 0, 0, 0
+    with torch.no_grad():
+        for idx, (label, text) in enumerate(dataloader):
+            label, text = label.to(DEVICE), text.to(DEVICE)
+            if model_type == 'ctm':
+                predictions, _, _ = model(text)
+                logits = predictions[:, :, -1]
+            else:
+                logits = model(text)
+            loss = criterion(logits, label)
+            total_acc += (logits.argmax(1) == label).sum().item()
+            total_loss += loss.item()
+            total_count += label.size(0)
+    return total_acc / total_count, total_loss / total_count
+
 train_dataset = NewsDataset(train_data)
 test_dataset = NewsDataset(test_data)
     
