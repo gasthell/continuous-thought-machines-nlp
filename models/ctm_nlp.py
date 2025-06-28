@@ -154,17 +154,88 @@ class CTM_NLP(ContinuousThoughtMachine):
         """
         The main forward pass for the NLP-adapted CTM.
 
-        Args:
-            input_ids (torch.Tensor): Token indices. Shape: (batch_size, sequence_length).
-            attention_mask (torch.Tensor, optional): Mask to avoid attending to padding tokens.
-                                                     Shape: (batch_size, sequence_length).
-                                                     `1` for tokens to attend to, `0` for padding.
-            track (bool): Flag to track internal CTM states for analysis.
-
-        Returns:
-            Tuple: (predictions, certainties, final_synchronization_state)
+        This method duplicates the logic of the parent's forward loop but
+        crucially calls its OWN `compute_features` method, ensuring the correct
+        NLP input pipeline is used. It does NOT call `super().forward()`.
         """
-        # We explicitly pass the input_ids and the crucial attention_mask to the
-        # base class's forward method. This requires a small modification to the
-        # base class to accept the mask.
-        return super().forward(x=input_ids, attention_mask=attention_mask, track=track)
+        x = input_ids # Use a generic name for consistency with parent logic
+        B = x.size(0)
+        device = x.device
+
+        # --- Tracking Initialization ---
+        if track:
+            pre_activations_tracking, post_activations_tracking = [], []
+            synch_out_tracking, synch_action_tracking = [], []
+            attention_tracking = []
+
+        # --- 1. Featurise Input Data using the CORRECT (child) method ---
+        # This is the key difference from the previous approach.
+        kv = self.compute_features(x)
+
+        # --- The rest of this code is a direct, safe copy from the parent's forward method ---
+
+        # --- 2. Initialise Recurrent State ---
+        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
+        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
+
+        # --- 3. Prepare Storage for Outputs ---
+        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
+        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+
+        # --- 4. Initialise Recurrent Synch Values  ---
+        decay_alpha_action, decay_beta_action, decay_alpha_out, decay_beta_out = None, None, None, None
+        
+        # Clamp decay params (as in original)
+        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
+        self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
+        r_action = torch.exp(-self.decay_params_action).unsqueeze(0)
+        r_out = torch.exp(-self.decay_params_out).unsqueeze(0)
+
+        # --- 5. Prepare Attention Mask for MHA ---
+        attn_mask_for_mha = (attention_mask == 0) if attention_mask is not None else None
+
+        # --- 6. Recurrent Loop ---
+        for stepi in range(self.iterations):
+            # All `self.*` calls here will correctly use the overridden methods
+            # from CTM_for_NLP if they exist (like synapses), or fall back to
+            # the parent's methods if they don't.
+            
+            sync_action, da_a, db_a = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, 'action')
+            decay_alpha_action, decay_beta_action = da_a, db_a
+            
+            q = self.q_proj(sync_action).unsqueeze(1)
+            attn_out, attn_weights = self.attention(q, kv, kv, key_padding_mask=attn_mask_for_mha, need_weights=True, average_attn_weights=False)
+            attn_out = attn_out.squeeze(1)
+
+            pre_synapse_input_concat = torch.cat((attn_out, activated_state), dim=-1)
+            pre_synapse_input = self.input_to_synapse_proj(pre_synapse_input_concat)
+
+            state = self.synapses(pre_synapse_input)
+            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+
+            activated_state = self.trace_processor(state_trace)
+            
+            sync_out, da_o, db_o = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, 'out')
+            decay_alpha_out, decay_beta_out = da_o, db_o
+
+            current_prediction = self.output_projector(sync_out)
+            current_certainty = self.compute_certainty(current_prediction)
+
+            predictions[..., stepi] = current_prediction
+            certainties[..., stepi] = current_certainty
+
+            if track:
+                pre_activations_tracking.append(state_trace[:, :, -1].detach().cpu().numpy())
+                post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                attention_tracking.append(attn_weights.detach().cpu().numpy())
+                synch_out_tracking.append(sync_out.detach().cpu().numpy())
+                synch_action_tracking.append(sync_action.detach().cpu().numpy())
+                
+        # --- 7. Return Values ---
+        if track:
+            # Recreate the tuple structure for consistency
+            sync_tuple = (np.array(synch_out_tracking), np.array(synch_action_tracking))
+            return predictions, certainties, sync_tuple, np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+        
+        # The original returns sync_out as the third element when not tracking
+        return predictions, certainties, sync_out
