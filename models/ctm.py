@@ -129,6 +129,7 @@ class ContinuousThoughtMachine(nn.Module):
         
         # --- Core CTM Modules ---
         self.synapses = self.get_synapses(synapse_depth, d_model, dropout)
+        self.input_to_synapse_proj = nn.LazyLinear(self.d_model)
         self.trace_processor = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout_nlm)
 
         #  --- Start States ---
@@ -476,7 +477,7 @@ class ContinuousThoughtMachine(nn.Module):
 
 
 
-    def forward(self, x, track=False):
+    def forward(self, x, attention_mask=None, track=False): # Add attention_mask
         B = x.size(0)
         device = x.device
 
@@ -506,8 +507,17 @@ class ContinuousThoughtMachine(nn.Module):
 
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
         # Compute learned weighting for synchronisation
-        
 
+        # --- Prepare attention mask for nn.MultiheadAttention ---
+        # It expects a boolean mask where True means "don't attend".
+        # Our input mask is typically 1=attend, 0=don't attend. So we invert it.
+        if attention_mask is not None:
+            # This creates a (B, 1, 1, S) mask for broadcasting with attn_weights (B, H, T, S)
+            # and inverts it so that padding tokens are True.
+            attn_mask_for_mha = (attention_mask == 0)
+        else:
+            attn_mask_for_mha = None
+        
         # --- Recurrent Loop  ---
         for stepi in range(self.iterations):
 
@@ -516,9 +526,15 @@ class ContinuousThoughtMachine(nn.Module):
 
             # --- Interact with Data via Attention ---
             q = self.q_proj(synchronisation_action).unsqueeze(1)
-            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+            attn_out, attn_weights = self.attention(
+                q, kv, kv,
+                key_padding_mask=attn_mask_for_mha,
+                average_attn_weights=False,
+                need_weights=True
+            )
             attn_out = attn_out.squeeze(1)
-            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+            pre_synapse_input_concat = torch.concatenate((attn_out, activated_state), dim=-1)
+            pre_synapse_input = self.input_to_synapse_proj(pre_synapse_input_concat)
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
